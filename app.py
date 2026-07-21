@@ -34,13 +34,17 @@ from extract import iter_extract_folder, list_input_files, order_columns, proces
 
 @st.cache_data(show_spinner=False)
 def _runtime_versions() -> dict[str, str]:
-    """Reúne versiones de las libs sensibles para OCR.
+    """Reúne versiones y hashes de las libs sensibles para OCR.
 
-    Tesseract se comporta distinto entre macOS (Homebrew, 5.x, spa_best) y
-    Ubuntu (apt, 4.x, spa liviano); saber esto de un vistazo es la forma más
-    rápida de explicar diferencias de calidad de lectura entre local y Cloud.
+    El delta más impactante para lecturas distintas suele ser el archivo
+    `spa.traineddata` (modelo LSTM del español): distintas distribuciones
+    empaquetan versiones diferentes con precisión desigual, y no hay forma
+    de detectarlo por número de versión — hay que mirar tamaño/hash.
     """
+    import hashlib
+    import importlib.metadata as _im
     import platform
+    import shutil
     versions: dict[str, str] = {
         'Sistema': f'{platform.system()} {platform.release()} ({platform.machine()})',
         'Python': platform.python_version(),
@@ -50,12 +54,46 @@ def _runtime_versions() -> dict[str, str]:
         versions['Tesseract'] = str(pytesseract.get_tesseract_version())
         langs = pytesseract.get_languages(config='')
         versions['Idiomas Tesseract'] = ', '.join(sorted(langs)) or '(ninguno)'
+        # Hash del modelo LSTM del español: si difiere entre local y Cloud,
+        # tenés un modelo distinto entrenado con datos distintos y la
+        # precisión sobre dígitos/acentos cambia — es la diferencia real.
+        traineddata_paths = [
+            '/opt/homebrew/share/tessdata/spa.traineddata',
+            '/usr/local/share/tessdata/spa.traineddata',
+            '/usr/share/tesseract-ocr/5/tessdata/spa.traineddata',
+            '/usr/share/tesseract-ocr/4.00/tessdata/spa.traineddata',
+            '/usr/share/tessdata/spa.traineddata',
+        ]
+        found_path = next((p for p in traineddata_paths if Path(p).is_file()), None)
+        if found_path:
+            data = Path(found_path).read_bytes()
+            versions['spa.traineddata'] = (
+                f'{len(data)//1024} KB, sha256={hashlib.sha256(data).hexdigest()[:12]}'
+            )
+        else:
+            versions['spa.traineddata'] = 'no encontrado en rutas estándar'
     except Exception as e:
         versions['Tesseract'] = f'error: {type(e).__name__}: {e}'
     try:
         import cv2
-        build = 'headless' if 'headless' in cv2.__file__.lower() else 'full'
-        versions['OpenCV'] = f'{cv2.__version__} ({build})'
+        # `opencv-python` y `opencv-python-headless` instalan el mismo módulo
+        # `cv2`; hay que preguntar al metadata de la distro para saber cuál.
+        installed = []
+        for dist_name in ('opencv-python-headless', 'opencv-python',
+                          'opencv-contrib-python-headless', 'opencv-contrib-python'):
+            try:
+                installed.append(f'{dist_name}=={_im.version(dist_name)}')
+            except _im.PackageNotFoundError:
+                continue
+        # Buscamos "GUI: NONE" o similar en el build info: ausencia de HighGUI
+        # es señal fiable de que es la variante headless.
+        build_info = cv2.getBuildInformation()
+        gui_line = next(
+            (line.strip() for line in build_info.splitlines() if 'GUI:' in line),
+            'GUI: ?',
+        )
+        pkg_label = ' + '.join(installed) or 'desconocido'
+        versions['OpenCV'] = f'{cv2.__version__} [{pkg_label}] {gui_line}'
     except Exception as e:
         versions['OpenCV'] = f'error: {e}'
     try:
@@ -75,6 +113,9 @@ def _runtime_versions() -> dict[str, str]:
         versions['Streamlit'] = st.__version__
     except Exception:
         pass
+    tess_binary = shutil.which('tesseract')
+    if tess_binary:
+        versions['Binario Tesseract'] = tess_binary
     return versions
 
 
