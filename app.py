@@ -996,6 +996,19 @@ with st.sidebar:
     )
 
     st.header('3. Ejecutar')
+    if st.session_state.get('extraction_partial_rows'):
+        partial_count = len({
+            r.get('archivo') for r in st.session_state['extraction_partial_rows']
+            if r.get('archivo')
+        })
+        st.warning(
+            f'♻️ Hay una corrida interrumpida con {partial_count} archivo(s) '
+            'ya procesados. Al presionar **Procesar y comparar** se retoma '
+            'desde ahí; usá **Descartar** si querés empezar limpio.'
+        )
+        if st.button('🗑️ Descartar corrida anterior', width='stretch'):
+            st.session_state.pop('extraction_partial_rows', None)
+            st.rerun()
     run = st.button('Procesar y comparar', type='primary', width='stretch')
 
 
@@ -1038,15 +1051,47 @@ def _stream_extraction(source_dir: Path, limit: int | None = None,
         st.markdown('#### Detalle por ítem')
         detail_slot = st.empty()
 
-    rows: list[dict] = []
+    import gc
+
+    # Reanudación: si una corrida previa se cayó por OOM, no re-procesamos los
+    # archivos que ya tenían filas extraídas. El usuario ve los KPIs desde 0
+    # pero el trabajo real (OCR + IA) no se repite.
+    already_done = set()
+    rows: list[dict] = list(st.session_state.get('extraction_partial_rows', []))
+    if rows:
+        already_done = {r.get('archivo') for r in rows if r.get('archivo')}
+        st.info(
+            f'♻️ Retomando corrida anterior: {len(already_done)} archivo(s) ya procesados, '
+            f'{len(rows)} filas ya extraídas. Se saltean.'
+        )
+    # `compare()` es lento cuando corre en cada iteración; para lotes grandes
+    # actualizamos el detalle cada `refresh_every` archivos y siempre al final.
+    refresh_every = 1 if effective <= 20 else 5
     processed = 0
     for _, _, f, new_rows in iter_extract_folder(source_dir, use_gemini=use_gemini):
         processed += 1
+        if f.name in already_done:
+            progress.progress(processed / effective, text=f'{processed} / {effective}')
+            files_metric.metric('📂 Archivos procesados', processed)
+            status.info(f'⏭️ [{processed}/{effective}] {f.name} — saltado (ya procesado)')
+            if processed >= effective:
+                break
+            continue
         rows.extend(new_rows)
+        # Persistimos en session_state después de cada archivo para que si el
+        # container muere por OOM podamos retomar sin perder todo el trabajo.
+        st.session_state['extraction_partial_rows'] = rows
+        # Liberamos el buffer local de la iteración y forzamos GC: el pipeline
+        # OCR deja imágenes grandes (300/400 DPI) que sin esto tardan varios
+        # segundos en ser recolectadas por ciclos.
+        del new_rows
+        gc.collect()
         status.info(f'📄 [{processed}/{effective}] {f.name} — {len(rows)} filas extraídas hasta ahora')
         progress.progress(processed / effective, text=f'{processed} / {effective}')
         files_metric.metric('📂 Archivos procesados', processed)
-        if rows:
+        is_last = processed >= effective
+        should_refresh = is_last or processed % refresh_every == 0
+        if rows and should_refresh:
             df_partial = order_columns(pd.DataFrame(rows))
             unique_docs = (
                 df_partial['no_doc'].map(_clean_id).replace('', pd.NA).nunique()
@@ -1077,6 +1122,7 @@ def _stream_extraction(source_dir: Path, limit: int | None = None,
                     height=420,
                     column_config=COLUMN_LABELS,
                 )
+                del partial_merged, partial_summary, partial_display
             else:
                 ok_metric.metric('📦 Ítems extraídos', len(df_partial))
                 if externa is not None:
@@ -1102,10 +1148,16 @@ def _stream_extraction(source_dir: Path, limit: int | None = None,
                     height=420,
                     column_config=COLUMN_LABELS,
                 )
-        if processed >= effective:
+                del partial_summary
+            del df_partial
+            gc.collect()
+        if is_last:
             break
 
     live_result.empty()
+    # La corrida terminó completa: descartamos el checkpoint para que la
+    # próxima ejecución arranque limpia y no ofrezca retomar por error.
+    st.session_state.pop('extraction_partial_rows', None)
     st.toast(f'✅ Extracción lista: {processed} archivos, {len(rows)} filas', icon='✅')
     if use_gemini:
         stats = extract_mod.GEMINI_STATS

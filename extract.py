@@ -1360,7 +1360,14 @@ def process_pdf(pdf_path: Path, use_gemini: bool = False, debug_dir: Path | None
 
     base['archivo'] = pdf_path.name
     base['archivo_hash'] = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
-    return [base] if not rows else [{**base, **r} for r in rows]
+    result = [base] if not rows else [{**base, **r} for r in rows]
+    # Cada imagen full-page a 300/400 DPI pesa 10-20 MB; sin liberar
+    # explícitamente, procesar 30+ archivos en Streamlit Cloud (1 GB de RAM)
+    # revienta el container y se pierde toda la corrida.
+    del img_300, img_400, rows_300, rows_400
+    import gc as _gc
+    _gc.collect()
+    return result
 
 
 # ─── Ejecución sobre carpeta / CLI ──────────────────────────────────────────
