@@ -32,6 +32,52 @@ import extract as extract_mod
 from extract import iter_extract_folder, list_input_files, order_columns, process_pdf
 
 
+@st.cache_data(show_spinner=False)
+def _runtime_versions() -> dict[str, str]:
+    """Reúne versiones de las libs sensibles para OCR.
+
+    Tesseract se comporta distinto entre macOS (Homebrew, 5.x, spa_best) y
+    Ubuntu (apt, 4.x, spa liviano); saber esto de un vistazo es la forma más
+    rápida de explicar diferencias de calidad de lectura entre local y Cloud.
+    """
+    import platform
+    versions: dict[str, str] = {
+        'Sistema': f'{platform.system()} {platform.release()} ({platform.machine()})',
+        'Python': platform.python_version(),
+    }
+    try:
+        import pytesseract
+        versions['Tesseract'] = str(pytesseract.get_tesseract_version())
+        langs = pytesseract.get_languages(config='')
+        versions['Idiomas Tesseract'] = ', '.join(sorted(langs)) or '(ninguno)'
+    except Exception as e:
+        versions['Tesseract'] = f'error: {type(e).__name__}: {e}'
+    try:
+        import cv2
+        build = 'headless' if 'headless' in cv2.__file__.lower() else 'full'
+        versions['OpenCV'] = f'{cv2.__version__} ({build})'
+    except Exception as e:
+        versions['OpenCV'] = f'error: {e}'
+    try:
+        versions['PyMuPDF'] = fitz.__version__
+    except Exception as e:
+        versions['PyMuPDF'] = f'error: {e}'
+    try:
+        import numpy as _np
+        versions['NumPy'] = _np.__version__
+    except Exception:
+        pass
+    try:
+        versions['Pandas'] = pd.__version__
+    except Exception:
+        pass
+    try:
+        versions['Streamlit'] = st.__version__
+    except Exception:
+        pass
+    return versions
+
+
 KEYS = ['no_doc', 'codigo']
 COMPARE_FIELDS = ['cant_despachada']
 
@@ -888,6 +934,10 @@ with st.sidebar:
             st.success(f'✅ IA respondiendo. {detail}')
         else:
             st.error(f'❌ IA no responde. {detail}')
+
+    with st.expander('🔧 Diagnóstico del entorno', expanded=False):
+        for label, value in _runtime_versions().items():
+            st.markdown(f'**{label}:** `{value}`')
 
     st.header('2. Base SAFISS')
     external_file = st.file_uploader(
