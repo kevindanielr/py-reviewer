@@ -6,8 +6,11 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
+import zipfile
 from difflib import SequenceMatcher
 from pathlib import Path
+
+SUPPORTED_SCAN_EXTS = {'.pdf', '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'}
 
 import fitz
 import pandas as pd
@@ -843,8 +846,10 @@ with st.sidebar:
     else:
         uploaded_files = st.file_uploader(
             'Archivos escaneados',
-            type=['pdf', 'png', 'jpg', 'jpeg', 'tif', 'tiff', 'bmp'],
+            type=['pdf', 'png', 'jpg', 'jpeg', 'tif', 'tiff', 'bmp', 'zip'],
             accept_multiple_files=True,
+            help=('Podés subir PDFs/imágenes sueltos o un ZIP con la '
+                  'carpeta comprimida (recomendado si son más de 50 archivos).'),
         )
 
     limit_enabled = st.checkbox('Limitar cantidad de archivos', value=False,
@@ -1044,9 +1049,40 @@ def run_extraction(externa: pd.DataFrame | None = None) -> pd.DataFrame | None:
     if not uploaded_files:
         st.error('Subí al menos un archivo escaneado')
         return None
-    uploaded_file_data = {
-        uploaded.name: bytes(uploaded.getbuffer()) for uploaded in uploaded_files
-    }
+    uploaded_file_data: dict[str, bytes] = {}
+    zip_count = 0
+    for uploaded in uploaded_files:
+        if uploaded.name.lower().endswith('.zip'):
+            zip_count += 1
+            try:
+                with zipfile.ZipFile(io.BytesIO(uploaded.getbuffer())) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        base_name = Path(info.filename).name
+                        if not base_name or base_name.startswith('.'):
+                            continue
+                        if Path(base_name).suffix.lower() not in SUPPORTED_SCAN_EXTS:
+                            continue
+                        # Ante colisión de nombre (misma requisición en dos ZIPs
+                        # o dentro de subcarpetas homónimas), la primera copia
+                        # que llegue gana; las siguientes se descartan.
+                        if base_name in uploaded_file_data:
+                            continue
+                        uploaded_file_data[base_name] = zf.read(info)
+            except zipfile.BadZipFile:
+                st.error(f'`{uploaded.name}` no es un ZIP válido.')
+                return None
+        else:
+            uploaded_file_data[uploaded.name] = bytes(uploaded.getbuffer())
+    if not uploaded_file_data:
+        st.error('No se encontraron PDFs ni imágenes en los archivos subidos.')
+        return None
+    if zip_count:
+        st.caption(
+            f'📦 {zip_count} ZIP(s) descomprimido(s) → '
+            f'{len(uploaded_file_data)} archivo(s) listos para procesar.'
+        )
     st.session_state['uploaded_file_data'] = uploaded_file_data
     with tempfile.TemporaryDirectory() as td:
         tp = Path(td)
