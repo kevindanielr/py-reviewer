@@ -31,6 +31,39 @@ except Exception:
 import extract as extract_mod
 from extract import iter_extract_folder, list_input_files, order_columns, process_pdf
 
+import json as _json
+
+# Checkpoint en disco: `session_state` vive en la RAM del container y muere
+# con él (OOM, reboot, deploy). `/tmp` en Streamlit Cloud sobrevive muchos
+# reinicios, así que persistimos ahí después de cada archivo procesado.
+CHECKPOINT_PATH = Path(tempfile.gettempdir()) / 'argos_extraction_checkpoint.json'
+
+
+def _save_checkpoint(rows: list[dict]) -> None:
+    try:
+        CHECKPOINT_PATH.write_text(_json.dumps(rows, default=str))
+    except Exception:
+        # Falla al persistir no debe frenar la extracción; el checkpoint es
+        # best-effort, y la corrida sigue con lo que quede en memoria.
+        pass
+
+
+def _load_checkpoint() -> list[dict]:
+    if not CHECKPOINT_PATH.is_file():
+        return []
+    try:
+        data = _json.loads(CHECKPOINT_PATH.read_text())
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _clear_checkpoint() -> None:
+    try:
+        CHECKPOINT_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+
 
 @st.cache_data(show_spinner=False)
 def _runtime_versions() -> dict[str, str]:
@@ -996,18 +1029,36 @@ with st.sidebar:
     )
 
     st.header('3. Ejecutar')
-    if st.session_state.get('extraction_partial_rows'):
+    _partial_rows_here = (
+        st.session_state.get('extraction_partial_rows') or _load_checkpoint()
+    )
+    if _partial_rows_here:
         partial_count = len({
-            r.get('archivo') for r in st.session_state['extraction_partial_rows']
-            if r.get('archivo')
+            r.get('archivo') for r in _partial_rows_here if r.get('archivo')
         })
         st.warning(
             f'♻️ Hay una corrida interrumpida con {partial_count} archivo(s) '
             'ya procesados. Al presionar **Procesar y comparar** se retoma '
             'desde ahí; usá **Descartar** si querés empezar limpio.'
         )
+        try:
+            partial_bytes = to_excel_bytes({
+                'parcial': order_columns(pd.DataFrame(_partial_rows_here)),
+            })
+            st.download_button(
+                '⬇️ Descargar filas parciales (Excel)',
+                data=partial_bytes,
+                file_name='argos_parcial.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                width='stretch',
+                help='Salvavidas: descargá lo extraído hasta ahora, sin esperar '
+                     'a que termine la corrida completa.',
+            )
+        except Exception as _exc:
+            st.caption(f'No se pudo armar el Excel parcial: {_exc}')
         if st.button('🗑️ Descartar corrida anterior', width='stretch'):
             st.session_state.pop('extraction_partial_rows', None)
+            _clear_checkpoint()
             st.rerun()
     run = st.button('Procesar y comparar', type='primary', width='stretch')
 
@@ -1055,9 +1106,13 @@ def _stream_extraction(source_dir: Path, limit: int | None = None,
 
     # Reanudación: si una corrida previa se cayó por OOM, no re-procesamos los
     # archivos que ya tenían filas extraídas. El usuario ve los KPIs desde 0
-    # pero el trabajo real (OCR + IA) no se repite.
+    # pero el trabajo real (OCR + IA) no se repite. Primero probamos con el
+    # session_state (rerun sin crash) y como fallback con el checkpoint en
+    # disco (sobrevive OOM/reboot del container en la mayoría de los casos).
     already_done = set()
     rows: list[dict] = list(st.session_state.get('extraction_partial_rows', []))
+    if not rows:
+        rows = _load_checkpoint()
     if rows:
         already_done = {r.get('archivo') for r in rows if r.get('archivo')}
         st.info(
@@ -1078,9 +1133,11 @@ def _stream_extraction(source_dir: Path, limit: int | None = None,
                 break
             continue
         rows.extend(new_rows)
-        # Persistimos en session_state después de cada archivo para que si el
+        # Persistimos en session_state (rápido, en RAM) Y en /tmp (sobrevive
+        # reinicios del container) después de cada archivo, para que si el
         # container muere por OOM podamos retomar sin perder todo el trabajo.
         st.session_state['extraction_partial_rows'] = rows
+        _save_checkpoint(rows)
         # Liberamos el buffer local de la iteración y forzamos GC: el pipeline
         # OCR deja imágenes grandes (300/400 DPI) que sin esto tardan varios
         # segundos en ser recolectadas por ciclos.
@@ -1155,9 +1212,10 @@ def _stream_extraction(source_dir: Path, limit: int | None = None,
             break
 
     live_result.empty()
-    # La corrida terminó completa: descartamos el checkpoint para que la
-    # próxima ejecución arranque limpia y no ofrezca retomar por error.
+    # La corrida terminó completa: descartamos el checkpoint (RAM + disco)
+    # para que la próxima ejecución arranque limpia y no ofrezca retomar.
     st.session_state.pop('extraction_partial_rows', None)
+    _clear_checkpoint()
     st.toast(f'✅ Extracción lista: {processed} archivos, {len(rows)} filas', icon='✅')
     if use_gemini:
         stats = extract_mod.GEMINI_STATS
