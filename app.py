@@ -83,12 +83,52 @@ with st.expander('👁️ Acerca de ARGOS, el guardián', expanded=False):
         'verificación de requisiciones y permita concentrar la atención humana donde '
         'realmente se necesita.'
     )
-with st.expander('ℹ️ Cómo se hace el cruce', expanded=False):
+with st.expander('🚀 Cómo usar ARGOS (paso a paso)', expanded=False):
     st.markdown(
-        '- **Cruce por `no_doc + codigo`** — cada ítem se identifica con el número de documento (OCR/nombre de archivo) y el código de material.\n'
-        '- **Sólo se comparan los documentos que escaneaste** — SAFISS se filtra a los `no_doc` de las requisiciones cargadas.\n'
-        '- **Sólo se compara `cant_despachada`** — se ignoran ítems de SAFISS sin despacho (cantidad = 0). Un documento es OK si **todos** sus ítems despachados coinciden en cantidad.\n'
-        '- Si subís un Excel con el formato SAFISS original (columnas `Material`, `Documento material`, `Ctd.en UM entrada`, etc.), se **normaliza automáticamente** al esquema del OCR.'
+        '**1. Cargá tus requisiciones escaneadas** (panel izquierdo)\n\n'
+        '   Podés apuntar a una **carpeta local** con los PDFs o subirlos '
+        'directamente. Se aceptan PDF e imágenes (PNG, JPG, TIFF).\n\n'
+        '**2. Subí el Excel de SAFISS** (panel izquierdo)\n\n'
+        '   Sirve el Excel original tal como lo descargás de SAFISS. ARGOS '
+        'reconoce automáticamente sus columnas (`Material`, `Documento '
+        'material`, `Ctd.en UM entrada`, etc.).\n\n'
+        '**3. Presioná "Procesar y comparar"**\n\n'
+        '   ARGOS va a leer cada requisición, extraer los ítems y compararlos '
+        'con SAFISS. Vas a ver el progreso en tiempo real.\n\n'
+        '**4. Revisá los resultados** (pestaña *Comparación*)\n\n'
+        '   Al final aparece un resumen con los KPIs principales y una tabla '
+        'de detalle. Podés hacer clic en una fila para ver el PDF original.\n\n'
+        '**5. Descargá el reporte en Excel** para archivar o compartir.'
+    )
+with st.expander('🎨 Qué significa cada color/estado', expanded=False):
+    st.markdown(
+        '- ✅ **OK** — el ítem coincide en cantidad con SAFISS.\n'
+        '- ❌ **Cantidad difiere** — el código está en ambos lados pero las '
+        'cantidades no coinciden. Revisá el escaneo original.\n'
+        '- 📄 **Solo escaneada** — el ítem aparece en la requisición pero no '
+        'está en SAFISS (posible faltante de registro en SAFISS o error de '
+        'lectura del código).\n'
+        '- ⚠️ **Solo en SAFISS** — SAFISS tiene un movimiento que no aparece '
+        'en la requisición escaneada (puede faltar el escaneo o el OCR omitió '
+        'la fila).\n'
+        '- 📅 **Fuera de rango SAFISS** — la fecha del documento cae fuera del '
+        'período que cargaste, así que no hay contra qué compararlo.'
+    )
+with st.expander('🔧 Cómo se hace el cruce (detalle técnico)', expanded=False):
+    st.markdown(
+        '- **Identificador**: cada ítem se identifica por el **número de '
+        'documento** y el **código de material**. El número de documento se '
+        'toma del OCR del PDF y se contrasta con el nombre del archivo y con '
+        'la lectura de la IA (si está activa) para elegir el más confiable.\n'
+        '- **Alcance**: solo se comparan los documentos que aparecen en tus '
+        'escaneos (SAFISS se filtra automáticamente).\n'
+        '- **Qué se compara**: la cantidad despachada. Los ítems de SAFISS con '
+        'cantidad cero (que no generaron movimiento) se ignoran. Un documento '
+        'se marca OK si **todos** sus ítems despachados coinciden.\n'
+        '- **Correcciones automáticas**: cuando el número de documento leído no '
+        'existe en SAFISS pero hay uno muy parecido (1 dígito distinto o '
+        'nombre truncado) con los mismos códigos, ARGOS lo remapea '
+        'automáticamente para evitar falsos positivos.'
     )
 
 
@@ -806,15 +846,15 @@ with st.sidebar:
 
     has_gemini_key = bool(os.getenv('GOOGLE_API_KEY'))
     use_gemini = st.checkbox(
-        '🤖 Potenciar con Gemini AI',
-        value=False,
+        '🤖 Potenciar con IA',
+        value=has_gemini_key,
         disabled=not has_gemini_key,
-        help=('Valida la tabla en 300 y 400 DPI, repara códigos dudosos y recupera '
-              'filas omitidas cuando una lectura completa las confirma. Las celdas '
-              'restantes se revisan individualmente. Requiere `GOOGLE_API_KEY` en `.env`.'),
+        help=('Revisa la tabla dos veces (300 y 400 DPI), corrige códigos '
+              'confusos, recupera filas que el OCR no detectó y valida celdas '
+              'dudosas. Se recomienda dejarlo activo para máxima precisión.'),
     )
     if not has_gemini_key:
-        st.caption('⚠️ Falta `GOOGLE_API_KEY` en `.env` para habilitar Gemini.')
+        st.caption('⚠️ El asistente de IA no está configurado en este servidor.')
 
     st.header('2. Base SAFISS')
     external_file = st.file_uploader(
