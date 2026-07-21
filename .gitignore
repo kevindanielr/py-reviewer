@@ -15,7 +15,6 @@ debug/
 ~$*.xlsx
 ~$*.xls
 
-# Datos sensibles (requisiciones reales, movimientos SAFISS, catálogos)
+# Datos sensibles (requisiciones reales, movimientos SAFISS)
 documentos/
-codigos.xlsx
 movimientos*.xlsx
