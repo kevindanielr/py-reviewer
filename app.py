@@ -824,12 +824,20 @@ def to_excel_bytes(dfs: dict[str, pd.DataFrame]) -> bytes:
 
 with st.sidebar:
     st.header('1. Requisiciones escaneadas')
-    src_mode = st.radio('Origen', ['Carpeta local', 'Subir archivos'])
+    # En entornos donde no existe la carpeta por default (p. ej. Streamlit
+    # Cloud), arranca en modo "Subir archivos" para que la app sea usable de
+    # entrada sin tener que cambiar el modo manualmente.
+    default_local_folder = Path(__file__).parent / 'documentos'
+    default_mode_index = 0 if default_local_folder.exists() else 1
+    src_mode = st.radio(
+        'Origen', ['Carpeta local', 'Subir archivos'],
+        index=default_mode_index,
+    )
     folder_path = uploaded_files = None
     if src_mode == 'Carpeta local':
         folder_path = st.text_input(
             'Ruta de la carpeta',
-            value=str(Path(__file__).parent / 'documentos'),
+            value=str(default_local_folder),
             help='Carpeta con las requisiciones escaneadas (PDF o imagen)',
         )
     else:
