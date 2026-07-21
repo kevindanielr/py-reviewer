@@ -1008,7 +1008,13 @@ def _ocr_codigo_gemini(img: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> s
     digits = ''.join(re.findall(r'\d+', text))
     if len(digits) != 9:
         return None
-    return digits if digits in _load_valid_codigos() else None
+    # Sin base maestra (Streamlit Cloud sin `codigos.xlsx`), aceptamos cualquier
+    # secuencia de 9 dígitos: filtrar exigiendo la base convertía a esta función
+    # en un no-op y hacía perder rescates válidos de códigos por parte de Gemini.
+    valid = _load_valid_codigos()
+    if valid and digits not in valid:
+        return None
+    return digits
 
 
 GEMINI_TABLE_PROMPT = (
@@ -1071,7 +1077,14 @@ def _extract_items_gemini(img: np.ndarray, y_start: int, y_end: int) -> list[dic
         if not isinstance(item, dict):
             continue
         cod = str(item.get('codigo', '')).strip()
-        if not cod or cod not in valid:
+        if not cod or not cod.isdigit() or len(cod) != 9:
+            continue
+        # Si tenemos la base maestra `codigos.xlsx`, la usamos como validación
+        # dura para descartar lecturas espurias. Si no está disponible (p. ej.
+        # Streamlit Cloud, donde el archivo queda fuera del repo), aceptamos
+        # cualquier código de 9 dígitos: es preferible tener algún falso
+        # positivo a perder silenciosamente todas las filas.
+        if valid and cod not in valid:
             continue
         out.append({
             'codigo': cod,
