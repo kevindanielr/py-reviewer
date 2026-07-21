@@ -16,6 +16,18 @@ import fitz
 import pandas as pd
 import streamlit as st
 
+# En Streamlit Cloud los secrets se configuran en el dashboard y sólo se
+# exponen vía `st.secrets`; el resto del código lee `os.environ`, así que
+# los replicamos ahí antes de importar cualquier módulo que consulte la key.
+try:
+    for _secret_key in ('GOOGLE_API_KEY',):
+        if _secret_key in st.secrets and not os.environ.get(_secret_key):
+            os.environ[_secret_key] = str(st.secrets[_secret_key])
+except Exception:
+    # Local sin `secrets.toml`: la key se toma del `.env` o del shell y no
+    # hay nada que replicar.
+    pass
+
 from extract import iter_extract_folder, list_input_files, order_columns, process_pdf
 
 
