@@ -28,6 +28,7 @@ except Exception:
     # hay nada que replicar.
     pass
 
+import extract as extract_mod
 from extract import iter_extract_folder, list_input_files, order_columns, process_pdf
 
 
@@ -880,6 +881,13 @@ with st.sidebar:
     )
     if not has_gemini_key:
         st.caption('⚠️ El asistente de IA no está configurado en este servidor.')
+    if has_gemini_key and st.button('🔎 Probar IA', width='stretch',
+                                    help='Hace una llamada mínima a Gemini para confirmar que la API key funciona.'):
+        ok_ping, detail = extract_mod.gemini_ping()
+        if ok_ping:
+            st.success(f'✅ IA respondiendo. {detail}')
+        else:
+            st.error(f'❌ IA no responde. {detail}')
 
     st.header('2. Base SAFISS')
     external_file = st.file_uploader(
@@ -899,6 +907,7 @@ def _stream_extraction(source_dir: Path, limit: int | None = None,
     if not files:
         st.error(f'No hay PDFs ni imágenes en {source_dir}')
         return None
+    extract_mod.reset_gemini_stats()
 
     total_files = len(files)
     effective = min(limit, total_files) if limit else total_files
@@ -999,6 +1008,21 @@ def _stream_extraction(source_dir: Path, limit: int | None = None,
 
     live_result.empty()
     st.toast(f'✅ Extracción lista: {processed} archivos, {len(rows)} filas', icon='✅')
+    if use_gemini:
+        stats = extract_mod.GEMINI_STATS
+        total_calls = stats['ok'] + stats['error']
+        if total_calls == 0:
+            st.warning(
+                '🤖 IA activa pero no se hizo ninguna llamada a Gemini. '
+                'Puede que los OCR locales no hayan encontrado celdas dudosas.'
+            )
+        elif stats['error']:
+            st.warning(
+                f"🤖 IA: {stats['ok']} llamadas OK, **{stats['error']} con error**. "
+                'Revisá los logs del servidor (Manage app → Logs) para el detalle.'
+            )
+        else:
+            st.info(f"🤖 IA: {stats['ok']} llamadas exitosas, 0 errores.")
     result = order_columns(pd.DataFrame(rows)) if rows else pd.DataFrame()
     if (externa is None and not result.empty
             and 'no_doc_coincide_archivo' in result.columns):

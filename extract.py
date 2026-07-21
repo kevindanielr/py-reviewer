@@ -852,9 +852,54 @@ def _ocr_cell(img: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> str:
 
 
 # ─── Enhancement opcional: Gemini AI (opt-in) ───────────────────────────────
+import sys as _sys
+import threading as _threading
+
 GEMINI_MODEL = 'gemini-2.5-flash'
 GEMINI_URL = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
 GEMINI_TIMEOUT = 20
+
+# Contadores en memoria: nos dan un termómetro claro de si Gemini se está
+# usando y con qué tasa de error, sin cambiar la API pública del módulo.
+GEMINI_STATS = {'ok': 0, 'error': 0, 'skipped_no_key': 0}
+_GEMINI_STATS_LOCK = _threading.Lock()
+
+
+def _gemini_track(kind: str, exc: Exception | None = None, context: str = '') -> None:
+    with _GEMINI_STATS_LOCK:
+        GEMINI_STATS[kind] = GEMINI_STATS.get(kind, 0) + 1
+    if exc is not None:
+        message = f'[gemini] {context or "call"} failed: {type(exc).__name__}: {exc}'
+        print(message, file=_sys.stderr, flush=True)
+
+
+def reset_gemini_stats() -> None:
+    with _GEMINI_STATS_LOCK:
+        for key in GEMINI_STATS:
+            GEMINI_STATS[key] = 0
+
+
+def gemini_ping() -> tuple[bool, str]:
+    """Prueba mínima contra el endpoint; útil para diagnosticar la key en vivo."""
+    api_key = os.getenv('GOOGLE_API_KEY')
+    if not api_key:
+        return False, 'GOOGLE_API_KEY no está configurada'
+    payload = {
+        'contents': [{'parts': [{'text': 'Respondé con la palabra: OK'}]}],
+        'generationConfig': {
+            'temperature': 0, 'maxOutputTokens': 8,
+            'thinkingConfig': {'thinkingBudget': 0},
+        },
+    }
+    try:
+        r = requests.post(f'{GEMINI_URL}?key={api_key}', json=payload, timeout=15)
+        r.raise_for_status()
+        text = r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+        return True, f'Respuesta: {text!r}'
+    except requests.HTTPError as e:
+        return False, f'HTTP {e.response.status_code}: {e.response.text[:200]}'
+    except Exception as e:
+        return False, f'{type(e).__name__}: {e}'
 GEMINI_PROMPT = (
     'Esta imagen es una celda de un formulario médico. Contiene un NÚMERO IMPRESO '
     '(dígitos 0-9) y posiblemente una X manuscrita al lado, encima o cruzándolo. '
@@ -881,6 +926,7 @@ def _gemini_read(img: np.ndarray, x1: int, y1: int, x2: int, y2: int, prompt: st
     """Envía un recorte a Gemini con el prompt dado. Recorta al centro si es multi-fila."""
     api_key = os.getenv('GOOGLE_API_KEY')
     if not api_key:
+        _gemini_track('skipped_no_key')
         return ''
     h_img = img.shape[0]
     if y2 - y1 > GEMINI_MAX_CELL_HEIGHT:
@@ -910,8 +956,10 @@ def _gemini_read(img: np.ndarray, x1: int, y1: int, x2: int, y2: int, prompt: st
         r = requests.post(f'{GEMINI_URL}?key={api_key}', json=payload, timeout=GEMINI_TIMEOUT)
         r.raise_for_status()
         text = r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
+    except Exception as e:
+        _gemini_track('error', e, 'cell read')
         return ''
+    _gemini_track('ok')
     if 'VACIO' in text.upper():
         return ''
     return text
@@ -921,6 +969,7 @@ def _ocr_doc_number_gemini(img: np.ndarray) -> str | None:
     """Lee con Gemini el No. Doc. SAFISS en la franja inferior del formulario."""
     api_key = os.getenv('GOOGLE_API_KEY')
     if not api_key:
+        _gemini_track('skipped_no_key')
         return None
     h, w = img.shape[:2]
     crop = img[int(h * 0.62):h, int(w * 0.10):int(w * 0.95)]
@@ -945,8 +994,10 @@ def _ocr_doc_number_gemini(img: np.ndarray) -> str | None:
         )
         response.raise_for_status()
         text = response.json()['candidates'][0]['content']['parts'][0]['text']
-    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
+    except Exception as e:
+        _gemini_track('error', e, 'doc number')
         return None
+    _gemini_track('ok')
     digits = ''.join(re.findall(r'\d', str(text)))
     return digits if len(digits) == 10 else None
 
@@ -977,6 +1028,7 @@ def _extract_items_gemini(img: np.ndarray, y_start: int, y_end: int) -> list[dic
     Filtra filas cuyo codigo no esté en BaseMateriales."""
     api_key = os.getenv('GOOGLE_API_KEY')
     if not api_key:
+        _gemini_track('skipped_no_key')
         return []
     h_img, w_img = img.shape[:2]
     y1 = max(0, y_start - 10)
@@ -1003,8 +1055,10 @@ def _extract_items_gemini(img: np.ndarray, y_start: int, y_end: int) -> list[dic
         r = requests.post(f'{GEMINI_URL}?key={api_key}', json=payload, timeout=60)
         r.raise_for_status()
         text = r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
+    except Exception as e:
+        _gemini_track('error', e, 'items table')
         return []
+    _gemini_track('ok')
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
