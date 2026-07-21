@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pdftotext \"/Users/danielrivas21/Documents/py-reviewer/documentos/4930843220_CLINICA PROCAPS_U300_11.01.2026 \\(2\\).pdf\" -)",
+      "Bash(git init *)",
+      "Bash(git add *)"
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+output/
+debug/
+
+# macOS
+.DS_Store
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Excel lock files
+~$*.xlsx
+~$*.xls
+
+# Datos sensibles (requisiciones reales, movimientos SAFISS, catálogos)
+documentos/
+codigos.xlsx
+movimientos*.xlsx
