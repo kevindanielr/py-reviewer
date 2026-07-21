@@ -1387,11 +1387,22 @@ def order_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df[cols]
 
 
-def iter_extract_folder(input_dir: Path, use_gemini: bool = False, debug_dir: Path | None = None):
-    """Genera (indice, total, archivo, filas_dict) por cada PDF procesado."""
+def iter_extract_folder(input_dir: Path, use_gemini: bool = False,
+                        debug_dir: Path | None = None,
+                        skip_names: set[str] | None = None):
+    """Genera (indice, total, archivo, filas_dict) por cada PDF procesado.
+
+    `skip_names` recibe nombres de archivo ya procesados (para reanudar tras
+    un OOM sin re-correr OCR + IA en los que ya estaban listos). Cuando un
+    archivo está en el set, se yieldea con filas vacías y sin invocar OCR.
+    """
+    skip_names = skip_names or set()
     files = list_input_files(input_dir)
     total = len(files)
     for i, f in enumerate(files):
+        if f.name in skip_names:
+            yield i + 1, total, f, []
+            continue
         try:
             rows = process_pdf(f, use_gemini=use_gemini, debug_dir=debug_dir)
         except Exception as e:

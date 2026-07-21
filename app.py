@@ -1123,7 +1123,9 @@ def _stream_extraction(source_dir: Path, limit: int | None = None,
     # actualizamos el detalle cada `refresh_every` archivos y siempre al final.
     refresh_every = 1 if effective <= 20 else 5
     processed = 0
-    for _, _, f, new_rows in iter_extract_folder(source_dir, use_gemini=use_gemini):
+    for _, _, f, new_rows in iter_extract_folder(
+        source_dir, use_gemini=use_gemini, skip_names=already_done,
+    ):
         processed += 1
         if f.name in already_done:
             progress.progress(processed / effective, text=f'{processed} / {effective}')
