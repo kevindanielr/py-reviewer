@@ -935,9 +935,17 @@ with st.sidebar:
         else:
             st.error(f'❌ IA no responde. {detail}')
 
-    with st.expander('🔧 Diagnóstico del entorno', expanded=False):
-        for label, value in _runtime_versions().items():
+    with st.expander('🔧 Diagnóstico del entorno', expanded=True):
+        _versions = _runtime_versions()
+        for label, value in _versions.items():
             st.markdown(f'**{label}:** `{value}`')
+        # También lo enviamos a stderr para poder verlo desde los logs del
+        # servidor sin necesidad de abrir el expander en la UI.
+        if not st.session_state.get('_diag_logged'):
+            import sys as _sys_diag
+            for _label, _value in _versions.items():
+                print(f'[diag] {_label}: {_value}', file=_sys_diag.stderr, flush=True)
+            st.session_state['_diag_logged'] = True
 
     st.header('2. Base SAFISS')
     external_file = st.file_uploader(
