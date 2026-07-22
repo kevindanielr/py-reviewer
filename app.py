@@ -1295,7 +1295,6 @@ def run_extraction(externa: pd.DataFrame | None = None) -> pd.DataFrame | None:
             st.error(f'Carpeta no existe: {p}')
             return None
         st.session_state['source_folder'] = str(p)
-        st.session_state.pop('uploaded_file_data', None)
         return _stream_extraction(
             p, limit=lim, use_gemini=use_gemini, externa=externa,
         )
@@ -1337,11 +1336,15 @@ def run_extraction(externa: pd.DataFrame | None = None) -> pd.DataFrame | None:
             f'📦 {zip_count} ZIP(s) descomprimido(s) → '
             f'{len(uploaded_file_data)} archivo(s) listos para procesar.'
         )
-    st.session_state['uploaded_file_data'] = uploaded_file_data
     with tempfile.TemporaryDirectory() as td:
         tp = Path(td)
         for name, data in uploaded_file_data.items():
             (tp / name).write_bytes(data)
+        # Liberamos los bytes de RAM en cuanto están en disco. En lotes de
+        # 100+ archivos, mantener el dict cargado consume cientos de MB en
+        # el container de Streamlit Community Cloud (~1 GB de límite).
+        uploaded_file_data.clear()
+        del uploaded_file_data
         return _stream_extraction(
             tp, limit=lim, use_gemini=use_gemini, externa=externa,
         )
@@ -1363,7 +1366,6 @@ def reprocess_documents_with_gemini(selected_docs: list[str]) -> tuple[int, list
         return 0, ['No se encontraron archivos para los documentos seleccionados.']
 
     source_folder = st.session_state.get('source_folder')
-    uploaded_file_data = st.session_state.get('uploaded_file_data', {})
     status = st.empty()
     progress = st.progress(0, text=f'0 / {len(file_names)}')
     replacement_rows: list[dict] = []
@@ -1378,11 +1380,14 @@ def reprocess_documents_with_gemini(selected_docs: list[str]) -> tuple[int, list
             )
             if source_folder:
                 file_path = Path(source_folder) / file_name
-            elif file_name in uploaded_file_data:
-                file_path = temporary_folder / file_name
-                file_path.write_bytes(uploaded_file_data[file_name])
             else:
-                failures.append(f'{file_name}: archivo original no disponible')
+                # Cuando la fuente fue upload no guardamos los bytes en
+                # session_state (ahorro de RAM), así que reprocesar con
+                # Gemini solo aplica al modo "Carpeta local".
+                failures.append(
+                    f'{file_name}: reprocesar con Gemini solo está disponible '
+                    'si la fuente fue una carpeta local.'
+                )
                 progress.progress(index / len(file_names), text=f'{index} / {len(file_names)}')
                 continue
 
