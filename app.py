@@ -1335,24 +1335,23 @@ def _cleanup_upload_tempdir() -> None:
         shutil.rmtree(existing, ignore_errors=True)
 
 
-def _prune_upload_tempdir_to_errors(
-    merged: pd.DataFrame, escaneada: pd.DataFrame,
+def _preserve_failing_pdfs(
+    source_dir: Path, escaneada: pd.DataFrame, externa: pd.DataFrame,
 ) -> None:
-    """Deja en el tempdir solo los PDFs de docs con inconsistencias.
+    """Copia a un tempdir persistente sólo los PDFs de docs con inconsistencias.
 
-    En un lote de 179 archivos, guardar todos los PDFs "por si acaso" llena
-    /tmp innecesariamente. Solo conservamos los que podrían necesitar
-    reproceso con Gemini bajo demanda (los que tienen `con_problemas > 0`).
+    Se invoca ANTES de que el TemporaryDirectory de la extracción se
+    autolimpe. Sin esto perderíamos los PDFs originales necesarios para el
+    reproceso con Gemini bajo demanda. Al copiar solo los que fallan
+    (típicamente 5-15 de 179), el uso de /tmp queda acotado a esos pocos
+    archivos — no a todo el batch.
     """
-    upload_dir = st.session_state.get('upload_temp_dir')
-    if not upload_dir:
-        return
-    upload_path = Path(upload_dir)
-    if not upload_path.exists():
+    if escaneada.empty:
         return
     if 'archivo' not in escaneada.columns or 'no_doc' not in escaneada.columns:
         return
     try:
+        merged = compare(externa.copy(), escaneada.copy())
         resumen = resumen_por_documento(merged)
     except Exception:
         return
@@ -1360,19 +1359,25 @@ def _prune_upload_tempdir_to_errors(
         _clean_id(doc)
         for doc in resumen.loc[resumen['con_problemas'] > 0, 'no_doc']
     }
+    if not problem_docs:
+        return
     keep_files = set(
         escaneada.loc[
             escaneada['no_doc'].map(_clean_id).isin(problem_docs),
             'archivo',
         ].dropna().astype(str)
     )
-    for f in upload_path.iterdir():
-        if f.name in keep_files:
-            continue
-        try:
-            f.unlink()
-        except OSError:
-            pass
+    if not keep_files:
+        return
+    persistent = Path(tempfile.mkdtemp(prefix='pyreviewer_gemini_'))
+    for name in keep_files:
+        src = source_dir / name
+        if src.exists():
+            try:
+                shutil.copy2(src, persistent / name)
+            except OSError:
+                pass
+    st.session_state['upload_temp_dir'] = str(persistent)
 
 
 def run_extraction(externa: pd.DataFrame | None = None) -> pd.DataFrame | None:
@@ -1428,22 +1433,27 @@ def run_extraction(externa: pd.DataFrame | None = None) -> pd.DataFrame | None:
             f'📦 {zip_count} ZIP(s) descomprimido(s) → '
             f'{len(uploaded_file_data)} archivo(s) listos para procesar.'
         )
-    # Tempdir persistente durante la sesión: no usamos `TemporaryDirectory`
-    # como context manager porque necesitamos los archivos vivos después de
-    # que `run_extraction` retorne, para poder reprocesar con Gemini bajo
-    # demanda. La RAM no se ve afectada (los bytes viven en disco).
-    tp = Path(tempfile.mkdtemp(prefix='pyreviewer_upload_'))
-    st.session_state['upload_temp_dir'] = str(tp)
-    for name, data in uploaded_file_data.items():
-        (tp / name).write_bytes(data)
-    # Liberamos los bytes de RAM en cuanto están en disco. En lotes de
-    # 100+ archivos, mantener el dict cargado consume cientos de MB en
-    # el container de Streamlit Community Cloud (~1 GB de límite).
-    uploaded_file_data.clear()
-    del uploaded_file_data
-    return _stream_extraction(
-        tp, limit=lim, use_gemini=use_gemini, externa=externa,
-    )
+    # Usamos `TemporaryDirectory` (autolimpieza) porque en Streamlit Cloud
+    # `/tmp` puede estar montado en tmpfs (RAM). Mantener 179 PDFs vivos
+    # durante toda la sesión consumía ~270 MB extra de RAM y hacía OOMear
+    # antes. Al salir del `with`, /tmp queda libre. Los PDFs de los docs
+    # que fallaron se copian a otro tempdir persistente (mucho más chico)
+    # justo antes de la autolimpieza.
+    with tempfile.TemporaryDirectory(prefix='pyreviewer_batch_') as td:
+        tp = Path(td)
+        for name, data in uploaded_file_data.items():
+            (tp / name).write_bytes(data)
+        # Liberamos los bytes de RAM en cuanto están en disco. En lotes de
+        # 100+ archivos, mantener el dict cargado consume cientos de MB.
+        uploaded_file_data.clear()
+        del uploaded_file_data
+        result = _stream_extraction(
+            tp, limit=lim, use_gemini=use_gemini, externa=externa,
+        )
+        if (result is not None and not result.empty
+                and externa is not None):
+            _preserve_failing_pdfs(tp, result, externa)
+        return result
 
 
 def reprocess_documents_with_gemini(selected_docs: list[str]) -> tuple[int, list[str]]:
@@ -1537,17 +1547,9 @@ if run:
             st.session_state['externa'] = externa
             st.session_state['safiss_range'] = _safiss_date_range(externa)
             st.session_state['merged'] = compare(externa.copy(), escaneada.copy())
-            # Con la comparación lista sabemos qué documentos tienen
-            # inconsistencias. Solo conservamos esos PDFs en el tempdir
-            # (los demás nunca se van a reprocesar con Gemini).
-            _prune_upload_tempdir_to_errors(
-                st.session_state['merged'], escaneada,
-            )
         except Exception as e:
             st.error(f'Error comparando: {e}')
     else:
-        # Sin base externa no hay reproceso posible: liberamos todo el tempdir.
-        _cleanup_upload_tempdir()
         st.info('Subí una base externa si querés comparar.')
 
 
