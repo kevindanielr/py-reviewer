@@ -2,6 +2,7 @@
 import io
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1122,6 +1123,12 @@ def _stream_extraction(source_dir: Path, limit: int | None = None,
     # `compare()` es lento cuando corre en cada iteración; para lotes grandes
     # actualizamos el detalle cada `refresh_every` archivos y siempre al final.
     refresh_every = 1 if effective <= 20 else 5
+    if refresh_every > 1:
+        st.caption(
+            f'ℹ️ Para no ralentizar el navegador con {effective} archivos, '
+            f'los KPIs y las tablas se actualizan cada {refresh_every} archivos '
+            '(la barra de progreso y el estado sí se actualizan en cada archivo).'
+        )
 
     def _refresh_display(current_rows: list[dict]) -> None:
         if not current_rows:
@@ -1213,7 +1220,10 @@ def _stream_extraction(source_dir: Path, limit: int | None = None,
         gc.collect()
         status.info(f'📄 [{processed}/{effective}] {f.name} — {len(rows)} filas extraídas hasta ahora')
         is_last = processed >= effective
-        should_refresh = is_last or processed % refresh_every == 0
+        # Forzamos un refresh en el primer archivo para que el usuario vea
+        # KPIs y tablas apenas arranca (sin esto, con lotes grandes tarda
+        # hasta `refresh_every` archivos en verse cualquier resultado).
+        should_refresh = is_last or processed == 1 or processed % refresh_every == 0
         if should_refresh:
             _refresh_display(rows)
             gc.collect()
@@ -1287,6 +1297,84 @@ def _stream_extraction(source_dir: Path, limit: int | None = None,
     return result
 
 
+def _paginate(
+    df: pd.DataFrame, key: str, sizes: tuple[int, ...] = (25, 50, 100, 250, 500),
+) -> tuple[pd.DataFrame, int]:
+    """Renderiza controles de paginación y devuelve (slice, offset_absoluto).
+
+    El offset se usa para traducir el índice de una fila seleccionada dentro
+    del slice a su posición en el DataFrame original.
+    """
+    if df.empty:
+        return df, 0
+    total = len(df)
+    col_size, col_page, col_info = st.columns([1, 1, 3])
+    page_size = col_size.selectbox(
+        'Filas por página', sizes, index=0,
+        key=f'{key}_size',
+    )
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = col_page.number_input(
+        f'Página (1–{total_pages})',
+        min_value=1, max_value=total_pages, value=1, step=1,
+        key=f'{key}_page',
+    )
+    start = (page - 1) * page_size
+    end = min(start + page_size, total)
+    col_info.caption(
+        f'Mostrando filas **{start + 1}–{end}** de **{total}** '
+        f'(página {page} de {total_pages}).'
+    )
+    return df.iloc[start:end], start
+
+
+def _cleanup_upload_tempdir() -> None:
+    """Borra el tempdir de uploads de la corrida anterior, si existe."""
+    existing = st.session_state.pop('upload_temp_dir', None)
+    if existing:
+        shutil.rmtree(existing, ignore_errors=True)
+
+
+def _prune_upload_tempdir_to_errors(
+    merged: pd.DataFrame, escaneada: pd.DataFrame,
+) -> None:
+    """Deja en el tempdir solo los PDFs de docs con inconsistencias.
+
+    En un lote de 179 archivos, guardar todos los PDFs "por si acaso" llena
+    /tmp innecesariamente. Solo conservamos los que podrían necesitar
+    reproceso con Gemini bajo demanda (los que tienen `con_problemas > 0`).
+    """
+    upload_dir = st.session_state.get('upload_temp_dir')
+    if not upload_dir:
+        return
+    upload_path = Path(upload_dir)
+    if not upload_path.exists():
+        return
+    if 'archivo' not in escaneada.columns or 'no_doc' not in escaneada.columns:
+        return
+    try:
+        resumen = resumen_por_documento(merged)
+    except Exception:
+        return
+    problem_docs = {
+        _clean_id(doc)
+        for doc in resumen.loc[resumen['con_problemas'] > 0, 'no_doc']
+    }
+    keep_files = set(
+        escaneada.loc[
+            escaneada['no_doc'].map(_clean_id).isin(problem_docs),
+            'archivo',
+        ].dropna().astype(str)
+    )
+    for f in upload_path.iterdir():
+        if f.name in keep_files:
+            continue
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
 def run_extraction(externa: pd.DataFrame | None = None) -> pd.DataFrame | None:
     lim = int(file_limit) if limit_enabled else None
     if src_mode == 'Carpeta local':
@@ -1295,6 +1383,7 @@ def run_extraction(externa: pd.DataFrame | None = None) -> pd.DataFrame | None:
             st.error(f'Carpeta no existe: {p}')
             return None
         st.session_state['source_folder'] = str(p)
+        _cleanup_upload_tempdir()
         return _stream_extraction(
             p, limit=lim, use_gemini=use_gemini, externa=externa,
         )
@@ -1302,6 +1391,9 @@ def run_extraction(externa: pd.DataFrame | None = None) -> pd.DataFrame | None:
     if not uploaded_files:
         st.error('Subí al menos un archivo escaneado')
         return None
+    # Limpiamos el tempdir de una corrida anterior antes de escribir el nuevo
+    # batch. Sin esto, /tmp se acumula corrida tras corrida.
+    _cleanup_upload_tempdir()
     uploaded_file_data: dict[str, bytes] = {}
     zip_count = 0
     for uploaded in uploaded_files:
@@ -1336,18 +1428,22 @@ def run_extraction(externa: pd.DataFrame | None = None) -> pd.DataFrame | None:
             f'📦 {zip_count} ZIP(s) descomprimido(s) → '
             f'{len(uploaded_file_data)} archivo(s) listos para procesar.'
         )
-    with tempfile.TemporaryDirectory() as td:
-        tp = Path(td)
-        for name, data in uploaded_file_data.items():
-            (tp / name).write_bytes(data)
-        # Liberamos los bytes de RAM en cuanto están en disco. En lotes de
-        # 100+ archivos, mantener el dict cargado consume cientos de MB en
-        # el container de Streamlit Community Cloud (~1 GB de límite).
-        uploaded_file_data.clear()
-        del uploaded_file_data
-        return _stream_extraction(
-            tp, limit=lim, use_gemini=use_gemini, externa=externa,
-        )
+    # Tempdir persistente durante la sesión: no usamos `TemporaryDirectory`
+    # como context manager porque necesitamos los archivos vivos después de
+    # que `run_extraction` retorne, para poder reprocesar con Gemini bajo
+    # demanda. La RAM no se ve afectada (los bytes viven en disco).
+    tp = Path(tempfile.mkdtemp(prefix='pyreviewer_upload_'))
+    st.session_state['upload_temp_dir'] = str(tp)
+    for name, data in uploaded_file_data.items():
+        (tp / name).write_bytes(data)
+    # Liberamos los bytes de RAM en cuanto están en disco. En lotes de
+    # 100+ archivos, mantener el dict cargado consume cientos de MB en
+    # el container de Streamlit Community Cloud (~1 GB de límite).
+    uploaded_file_data.clear()
+    del uploaded_file_data
+    return _stream_extraction(
+        tp, limit=lim, use_gemini=use_gemini, externa=externa,
+    )
 
 
 def reprocess_documents_with_gemini(selected_docs: list[str]) -> tuple[int, list[str]]:
@@ -1366,45 +1462,39 @@ def reprocess_documents_with_gemini(selected_docs: list[str]) -> tuple[int, list
         return 0, ['No se encontraron archivos para los documentos seleccionados.']
 
     source_folder = st.session_state.get('source_folder')
+    upload_folder = st.session_state.get('upload_temp_dir')
+    if not source_folder and not upload_folder:
+        return 0, ['No hay archivos originales disponibles para reprocesar.']
+
     status = st.empty()
     progress = st.progress(0, text=f'0 / {len(file_names)}')
     replacement_rows: list[dict] = []
     replaced_files: list[str] = []
     failures: list[str] = []
 
-    with tempfile.TemporaryDirectory() as td:
-        temporary_folder = Path(td)
-        for index, file_name in enumerate(file_names, start=1):
-            status.info(
-                f'🤖 Reprocesando [{index}/{len(file_names)}] {file_name} con Gemini'
-            )
-            if source_folder:
-                file_path = Path(source_folder) / file_name
-            else:
-                # Cuando la fuente fue upload no guardamos los bytes en
-                # session_state (ahorro de RAM), así que reprocesar con
-                # Gemini solo aplica al modo "Carpeta local".
-                failures.append(
-                    f'{file_name}: reprocesar con Gemini solo está disponible '
-                    'si la fuente fue una carpeta local.'
-                )
-                progress.progress(index / len(file_names), text=f'{index} / {len(file_names)}')
-                continue
+    for index, file_name in enumerate(file_names, start=1):
+        status.info(
+            f'🤖 Reprocesando [{index}/{len(file_names)}] {file_name} con Gemini'
+        )
+        if source_folder:
+            file_path = Path(source_folder) / file_name
+        else:
+            file_path = Path(upload_folder) / file_name
 
-            if not file_path.exists():
-                failures.append(f'{file_name}: archivo no encontrado')
-                progress.progress(index / len(file_names), text=f'{index} / {len(file_names)}')
-                continue
-
-            new_rows = process_pdf(file_path, use_gemini=True)
-            valid_rows = [row for row in new_rows if row.get('codigo')]
-            if not valid_rows:
-                error = new_rows[0].get('error', 'sin filas válidas') if new_rows else 'sin resultados'
-                failures.append(f'{file_name}: {error}')
-            else:
-                replacement_rows.extend(new_rows)
-                replaced_files.append(file_name)
+        if not file_path.exists():
+            failures.append(f'{file_name}: archivo no encontrado')
             progress.progress(index / len(file_names), text=f'{index} / {len(file_names)}')
+            continue
+
+        new_rows = process_pdf(file_path, use_gemini=True)
+        valid_rows = [row for row in new_rows if row.get('codigo')]
+        if not valid_rows:
+            error = new_rows[0].get('error', 'sin filas válidas') if new_rows else 'sin resultados'
+            failures.append(f'{file_name}: {error}')
+        else:
+            replacement_rows.extend(new_rows)
+            replaced_files.append(file_name)
+        progress.progress(index / len(file_names), text=f'{index} / {len(file_names)}')
 
     status.empty()
     progress.empty()
@@ -1447,9 +1537,17 @@ if run:
             st.session_state['externa'] = externa
             st.session_state['safiss_range'] = _safiss_date_range(externa)
             st.session_state['merged'] = compare(externa.copy(), escaneada.copy())
+            # Con la comparación lista sabemos qué documentos tienen
+            # inconsistencias. Solo conservamos esos PDFs en el tempdir
+            # (los demás nunca se van a reprocesar con Gemini).
+            _prune_upload_tempdir_to_errors(
+                st.session_state['merged'], escaneada,
+            )
         except Exception as e:
             st.error(f'Error comparando: {e}')
     else:
+        # Sin base externa no hay reproceso posible: liberamos todo el tempdir.
+        _cleanup_upload_tempdir()
         st.info('Subí una base externa si querés comparar.')
 
 
@@ -1710,20 +1808,33 @@ if 'merged' in st.session_state:
                     key=f'gemini_reprocess_docs_{reprocess_generation}',
                     placeholder='Seleccioná los documentos a verificar',
                 )
-                reprocess_button = st.button(
-                    '🤖 Reprocesar seleccionados con Gemini',
-                    type='primary',
+                col_selected, col_all = st.columns(2)
+                reprocess_button = col_selected.button(
+                    '🤖 Reprocesar seleccionados',
+                    type='secondary',
                     width='stretch',
                     disabled=not selected_for_reprocess or not has_gemini_key,
                     key=f'gemini_reprocess_button_{reprocess_generation}',
+                )
+                reprocess_all_button = col_all.button(
+                    f'🤖 Reprocesar TODOS los {len(reprocess_options)} con inconsistencias',
+                    type='primary',
+                    width='stretch',
+                    disabled=not has_gemini_key,
+                    key=f'gemini_reprocess_all_button_{reprocess_generation}',
                 )
                 if not has_gemini_key:
                     st.warning(
                         'Configurá `GOOGLE_API_KEY` para habilitar el reproceso con Gemini.'
                     )
+                docs_to_reprocess: list[str] | None = None
                 if reprocess_button:
+                    docs_to_reprocess = selected_for_reprocess
+                elif reprocess_all_button:
+                    docs_to_reprocess = reprocess_options
+                if docs_to_reprocess:
                     replaced_count, failures = reprocess_documents_with_gemini(
-                        selected_for_reprocess
+                        docs_to_reprocess
                     )
                     if replaced_count:
                         st.session_state['gemini_reprocess_feedback'] = (
@@ -1826,7 +1937,8 @@ if 'merged' in st.session_state:
             render_detail_toolbar()
             st.info('No hay filas que mostrar con los filtros actuales.')
         else:
-            display = view.copy()
+            view_page, page_offset = _paginate(view, key='detalle_items')
+            display = view_page.copy()
             display['estado'] = display['estado'].map(estado_label)
             table_data = display
             if len(display) > MAX_STYLED_ROWS:
@@ -1851,7 +1963,10 @@ if 'merged' in st.session_state:
             selected_doc = None
             document_error = None
             if selected_rows:
-                selected = view.iloc[selected_rows[0]]
+                # El índice de la fila seleccionada es relativo al slice de
+                # la página actual: sumamos el offset para traducirlo a la
+                # posición absoluta en `view`.
+                selected = view.iloc[page_offset + selected_rows[0]]
                 selected_doc = _clean_id(selected['no_doc'])
                 source_folder = st.session_state.get('source_folder')
                 escaneada_df = st.session_state.get('escaneada')
@@ -1880,15 +1995,18 @@ if 'merged' in st.session_state:
                     st.session_state.pop('document_preview', None)
 
     with tab_esc:
-        st.dataframe(st.session_state['escaneada'], width='stretch', hide_index=True,
+        esc_page, _ = _paginate(st.session_state['escaneada'], key='tab_escaneada')
+        st.dataframe(esc_page, width='stretch', hide_index=True,
                      column_config=COLUMN_LABELS)
     with tab_ext:
-        st.dataframe(st.session_state['externa'], width='stretch', hide_index=True,
+        ext_page, _ = _paginate(st.session_state['externa'], key='tab_externa')
+        st.dataframe(ext_page, width='stretch', hide_index=True,
                      column_config=COLUMN_LABELS)
 
 elif 'escaneada' in st.session_state:
     st.subheader('Dataset extraído')
-    st.dataframe(st.session_state['escaneada'], width='stretch', hide_index=True,
+    esc_page, _ = _paginate(st.session_state['escaneada'], key='dataset_extraido')
+    st.dataframe(esc_page, width='stretch', hide_index=True,
                  column_config=COLUMN_LABELS)
 
 else:
