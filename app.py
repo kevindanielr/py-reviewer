@@ -1122,14 +1122,80 @@ def _stream_extraction(source_dir: Path, limit: int | None = None,
     # `compare()` es lento cuando corre en cada iteración; para lotes grandes
     # actualizamos el detalle cada `refresh_every` archivos y siempre al final.
     refresh_every = 1 if effective <= 20 else 5
+
+    def _refresh_display(current_rows: list[dict]) -> None:
+        if not current_rows:
+            return
+        df_partial = order_columns(pd.DataFrame(current_rows))
+        unique_docs = (
+            df_partial['no_doc'].map(_clean_id).replace('', pd.NA).nunique()
+            if 'no_doc' in df_partial.columns else 0
+        )
+        docs_metric.metric('📄 Documentos únicos', unique_docs)
+
+        if externa is not None and all(key in df_partial.columns for key in KEYS):
+            partial_merged = compare(externa.copy(), df_partial.copy())
+            partial_summary = resumen_por_documento(partial_merged).copy()
+            docs_ok = int((partial_summary['ok'] == partial_summary['items']).sum())
+            docs_issues = int(len(partial_summary) - docs_ok)
+            ok_metric.metric('✅ Documentos OK', docs_ok)
+            issues_metric.metric('⚠️ Con inconsistencias', docs_issues)
+            summary_slot.dataframe(
+                partial_summary,
+                width='stretch',
+                hide_index=True,
+                height=min(240, 60 + 35 * len(partial_summary)),
+                column_config=COLUMN_LABELS,
+            )
+            partial_display = partial_merged.copy()
+            partial_display['estado'] = partial_display['estado'].map(estado_label)
+            detail_slot.dataframe(
+                partial_display,
+                width='stretch',
+                hide_index=True,
+                height=420,
+                column_config=COLUMN_LABELS,
+            )
+        else:
+            ok_metric.metric('📦 Ítems extraídos', len(df_partial))
+            if externa is not None:
+                issues_metric.metric('⚠️ Con inconsistencias', 0)
+            else:
+                issues_metric.metric('⚠️ Con inconsistencias', '—')
+            summary_columns = [
+                column for column in ('archivo', 'no_doc')
+                if column in df_partial.columns
+            ]
+            partial_summary = df_partial[summary_columns].drop_duplicates()
+            summary_slot.dataframe(
+                partial_summary,
+                width='stretch',
+                hide_index=True,
+                height=min(240, 60 + 35 * len(partial_summary)),
+                column_config=COLUMN_LABELS,
+            )
+            detail_slot.dataframe(
+                df_partial,
+                width='stretch',
+                hide_index=True,
+                height=420,
+                column_config=COLUMN_LABELS,
+            )
+
+    # Render inicial cuando reanudamos: si no lo hacemos, los KPIs y tablas
+    # quedan en cero durante toda la fase de skips y el usuario no ve el
+    # trabajo hecho hasta que se procese algún archivo nuevo.
+    if rows:
+        _refresh_display(rows)
+
     processed = 0
     for _, _, f, new_rows in iter_extract_folder(
         source_dir, use_gemini=use_gemini, skip_names=already_done,
     ):
         processed += 1
+        progress.progress(processed / effective, text=f'{processed} / {effective}')
+        files_metric.metric('📂 Archivos procesados', processed)
         if f.name in already_done:
-            progress.progress(processed / effective, text=f'{processed} / {effective}')
-            files_metric.metric('📂 Archivos procesados', processed)
             status.info(f'⏭️ [{processed}/{effective}] {f.name} — saltado (ya procesado)')
             if processed >= effective:
                 break
@@ -1146,69 +1212,10 @@ def _stream_extraction(source_dir: Path, limit: int | None = None,
         del new_rows
         gc.collect()
         status.info(f'📄 [{processed}/{effective}] {f.name} — {len(rows)} filas extraídas hasta ahora')
-        progress.progress(processed / effective, text=f'{processed} / {effective}')
-        files_metric.metric('📂 Archivos procesados', processed)
         is_last = processed >= effective
         should_refresh = is_last or processed % refresh_every == 0
-        if rows and should_refresh:
-            df_partial = order_columns(pd.DataFrame(rows))
-            unique_docs = (
-                df_partial['no_doc'].map(_clean_id).replace('', pd.NA).nunique()
-                if 'no_doc' in df_partial.columns else 0
-            )
-            docs_metric.metric('📄 Documentos únicos', unique_docs)
-
-            if externa is not None and all(key in df_partial.columns for key in KEYS):
-                partial_merged = compare(externa.copy(), df_partial.copy())
-                partial_summary = resumen_por_documento(partial_merged).copy()
-                docs_ok = int((partial_summary['ok'] == partial_summary['items']).sum())
-                docs_issues = int(len(partial_summary) - docs_ok)
-                ok_metric.metric('✅ Documentos OK', docs_ok)
-                issues_metric.metric('⚠️ Con inconsistencias', docs_issues)
-                summary_slot.dataframe(
-                    partial_summary,
-                    width='stretch',
-                    hide_index=True,
-                    height=min(240, 60 + 35 * len(partial_summary)),
-                    column_config=COLUMN_LABELS,
-                )
-                partial_display = partial_merged.copy()
-                partial_display['estado'] = partial_display['estado'].map(estado_label)
-                detail_slot.dataframe(
-                    partial_display,
-                    width='stretch',
-                    hide_index=True,
-                    height=420,
-                    column_config=COLUMN_LABELS,
-                )
-                del partial_merged, partial_summary, partial_display
-            else:
-                ok_metric.metric('📦 Ítems extraídos', len(df_partial))
-                if externa is not None:
-                    issues_metric.metric('⚠️ Con inconsistencias', 0)
-                else:
-                    issues_metric.metric('⚠️ Con inconsistencias', '—')
-                summary_columns = [
-                    column for column in ('archivo', 'no_doc')
-                    if column in df_partial.columns
-                ]
-                partial_summary = df_partial[summary_columns].drop_duplicates()
-                summary_slot.dataframe(
-                    partial_summary,
-                    width='stretch',
-                    hide_index=True,
-                    height=min(240, 60 + 35 * len(partial_summary)),
-                    column_config=COLUMN_LABELS,
-                )
-                detail_slot.dataframe(
-                    df_partial,
-                    width='stretch',
-                    hide_index=True,
-                    height=420,
-                    column_config=COLUMN_LABELS,
-                )
-                del partial_summary
-            del df_partial
+        if should_refresh:
+            _refresh_display(rows)
             gc.collect()
         if is_last:
             break
